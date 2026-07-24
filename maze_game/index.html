@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hardware Marble Maze</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.min.js"></script>
+</head>
+
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col justify-between overflow-hidden">
+
+    <!-- Top Info Navbar -->
+    <header class="bg-slate-900 border-b border-slate-800 px-6 py-4 flex justify-between items-center">
+        <div>
+            <h1 class="text-xl font-black tracking-wider text-cyan-400">🏎️ ACCEL-MAZE</h1>
+            <p class="text-xs text-slate-400">Tilt your physical hardware controller to guide the marble</p>
+        </div>
+        <div id="status-badge"
+            class="px-3 py-1 rounded-full text-xs font-bold bg-red-950 text-red-400 border border-red-800">
+            DISCONNECTED
+        </div>
+    </header>
+
+    <!-- Main Game Arena -->
+    <main class="flex-1 flex flex-col items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-800 p-4 rounded-2xl shadow-2xl flex flex-col items-center gap-4">
+
+            <!-- Physics Canvas -->
+            <canvas id="mazeCanvas" width="500" height="500"
+                class="bg-slate-950 rounded-lg border-2 border-slate-700"></canvas>
+
+            <!-- Live Vector Diagnostics -->
+            <div class="flex gap-8 text-sm font-mono bg-slate-950/50 px-6 py-2 rounded-full border border-slate-800">
+                <div>Tilt X: <span id="valX" class="text-indigo-400">0.00</span></div>
+                <div>Tilt Y: <span id="valY" class="text-amber-400">0.00</span></div>
+                <div id="game-status" class="text-emerald-400 font-bold animate-pulse">NAVIGATE TO THE GREEN TARGET
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <footer class="text-center py-2 text-xs text-slate-600 border-t border-slate-900 bg-slate-950">
+        Nexus Physics Simulator Engine
+    </footer>
+
+    <script>
+        const canvas = document.getElementById('mazeCanvas');
+        const ctx = canvas.getContext('2d');
+
+        const socket = io("http://localhost:5000");
+
+        // --- MAZE & PHYSICS CONFIGURATION ---
+        const COLS = 10;
+        const ROWS = 10;
+        const CELL_SIZE = canvas.width / COLS;
+
+        // 1 = Wall, 0 = Path, 2 = Start, 3 = Goal (Target)
+        const maze = [
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 2, 0, 0, 1, 0, 0, 0, 0, 1],
+            [1, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+            [1, 0, 0, 0, 0, 0, 1, 0, 0, 1],
+            [1, 0, 1, 1, 1, 1, 1, 0, 1, 1],
+            [1, 0, 1, 0, 0, 0, 0, 0, 0, 1],
+            [1, 0, 1, 0, 1, 1, 1, 1, 0, 1],
+            [1, 0, 1, 0, 1, 0, 0, 1, 0, 1],
+            [1, 0, 0, 0, 0, 0, 0, 1, 3, 1],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        ];
+
+        // Ball/Marble definition
+        let ball = {
+            x: 1.5 * CELL_SIZE,
+            y: 1.5 * CELL_SIZE,
+            radius: CELL_SIZE * 0.3,
+            vx: 0,
+            vy: 0,
+            friction: 0.95 // Helps keep the marble from sliding uncontrollably
+        };
+
+        // Accelerometer Force Multiplier
+        const FORCE_MULTIPLIER = 0.15;
+        let currentAx = 0;
+        let currentAy = 0;
+        let gameOver = false;
+
+        // --- GAME ENGINE FUNCTIONS ---
+
+        function drawMaze() {
+            for (let r = 0; r < ROWS; r++) {
+                for (let c = 0; c < COLS; c++) {
+                    if (maze[r][c] === 1) {
+                        ctx.fillStyle = '#1e293b'; // Slate-800 (Walls)
+                        ctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+                        ctx.strokeStyle = '#334155';
+                        ctx.strokeRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+                    } else if (maze[r][c] === 3) {
+                        ctx.fillStyle = 'rgba(16, 185, 129, 0.3)'; // Semi-transparent target
+                        ctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+                        // Pulsing inner target circle
+                        ctx.beginPath();
+                        ctx.arc((c + 0.5) * CELL_SIZE, (r + 0.5) * CELL_SIZE, CELL_SIZE * 0.25, 0, Math.PI * 2);
+                        ctx.fillStyle = '#10b981'; // Emerald-500
+                        ctx.fill();
+                    }
+                }
+            }
+        }
+
+        function drawBall() {
+            ctx.beginPath();
+            ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
+            ctx.fillStyle = '#38bdf8'; // Sky blue marble
+            ctx.shadowBlur = 10;
+            ctx.shadowColor = '#38bdf8';
+            ctx.fill();
+            ctx.shadowBlur = 0; // Reset shadow
+        }
+
+        function checkWallCollision(newX, newY) {
+            // Look ahead and check bounding box bounds against maze walls
+            let checkPoints = [
+                { x: newX - ball.radius, y: newY - ball.radius },
+                { x: newX + ball.radius, y: newY - ball.radius },
+                { x: newX - ball.radius, y: newY + ball.radius },
+                { x: newX + ball.radius, y: newY + ball.radius }
+            ];
+
+            for (let pt of checkPoints) {
+                let c = Math.floor(pt.x / CELL_SIZE);
+                let r = Math.floor(pt.y / CELL_SIZE);
+
+                if (r >= 0 && r < ROWS && c >= 0 && c < COLS) {
+                    if (maze[r][c] === 1) return true; // Inside a wall
+                } else {
+                    return true; // Out of canvas bounds
+                }
+            }
+            return false;
+        }
+
+        function checkWinCondition() {
+            let currentCellC = Math.floor(ball.x / CELL_SIZE);
+            let currentCellR = Math.floor(ball.y / CELL_SIZE);
+
+            if (maze[currentCellR]?.[currentCellC] === 3 && !gameOver) {
+                gameOver = true;
+                document.getElementById('game-status').innerText = "🏆 YOU WIN! STAGE CLEARED";
+                document.getElementById('game-status').className = "text-yellow-400 font-bold animate-bounce";
+            }
+        }
+
+        function updatePhysics() {
+            if (gameOver) return;
+
+            // Apply incoming hardware tilt values as acceleration forces
+            ball.vx += currentAx;
+            ball.vy += currentAy;
+
+            // Apply friction drag
+            ball.vx *= ball.friction;
+            ball.vy *= ball.friction;
+
+            // Attempt movement on X axis
+            let nextX = ball.x + ball.vx;
+            if (!checkWallCollision(nextX, ball.y)) {
+                ball.x = nextX;
+            } else {
+                ball.vx = 0; // Bounce/stop hard on wall impact
+            }
+
+            // Attempt movement on Y axis
+            let nextY = ball.y + ball.vy;
+            if (!checkWallCollision(ball.x, nextY)) {
+                ball.y = nextY;
+            } else {
+                ball.vy = 0;
+            }
+
+            checkWinCondition();
+        }
+
+        // Main Game Loop running at 60 FPS
+        function gameLoop() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            drawMaze();
+            updatePhysics();
+            drawBall();
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        // Start rendering engine immediately
+        gameLoop();
+
+
+        // --- SOCKET.IO HANDLERS ---
+
+        socket.on('connect', () => {
+            console.log("Connected to Flask server");
+        });
+
+        socket.on('disconnect', () => {
+            console.log("Disconnected from Flask server");
+            const el = document.getElementById('status-badge');
+            el.className = "px-3 py-1 rounded-full text-xs font-bold bg-red-950 text-red-400 border border-red-800";
+            el.innerText = "SERVER DISCONNECTED";
+        });
+
+        socket.on('status', (status) => {
+            const el = document.getElementById('status-badge');
+            if (status.connected) {
+                el.className = "px-3 py-1 rounded-full text-xs font-bold bg-emerald-950 text-emerald-400 border border-emerald-800";
+                el.innerText = `HARDWARE ONLINE: ${status.port}`;
+            } else {
+                el.className = "px-3 py-1 rounded-full text-xs font-bold bg-red-950 text-red-400 border border-red-800";
+                el.innerText = status.error ? status.error.toUpperCase() : "DISCONNECTED";
+            }
+        });
+
+        socket.on('sensor_data', (data) => {
+            // Prevent crashes if data structure isn't exactly as expected
+            if (data.x === undefined || data.y === undefined) return;
+
+            // Display raw text diagnostics
+            document.getElementById('valX').innerText = Number(data.x).toFixed(2);
+            document.getElementById('valY').innerText = Number(data.y).toFixed(2);
+
+            // Update active physical forces pushing the marble
+            currentAx = Number(data.x) * FORCE_MULTIPLIER;
+            currentAy = Number(data.y) * FORCE_MULTIPLIER;
+        });
+
+    </script>
+</body>
+
+</html>
